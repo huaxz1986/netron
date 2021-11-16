@@ -29,12 +29,12 @@ xml.TextReader = class {
 
     read() {
         const decoder = text.Decoder.open(this._data);
+        this._decoder = decoder.encoding === 'utf-8' ? text.Decoder.open(this._data, 'utf-8') : decoder;
         const document = new xml.Document();
         this._stack = [];
         this._push(document);
-        this._decoder = decoder;
         this._position = 0;
-        this._char = decoder.decode();
+        this._char = this._decoder.decode();
         for (;;) {
             switch (this._char) {
                 case '<': {
@@ -44,10 +44,40 @@ xml.TextReader = class {
                             this._next();
                             const name = this._name();
                             this._assert(name !== null);
-                            if (this._char !== '?') {
-                                this._whitespace(1);
-                            }
+                            let whitespace = this._char === '?' ? false : this._whitespace(1);
+                            const position = this._position;
                             const data = this._terminal('?>');
+                            if (name === 'xml') {
+                                const obj = { version: '1.0', encoding: '', standalone: 'no' };
+                                this._seek(position);
+                                this._assert(data.length > 0 && this._stack.length === 1 && this._top().childNodes.length === 0);
+                                while (this._char !== '?') {
+                                    if (!whitespace) {
+                                        this._unexpected();
+                                    }
+                                    const name = this._name();
+                                    if (name) {
+                                        this._whitespace(0);
+                                        this._expect('=');
+                                        this._whitespace(0);
+                                        if (obj[name] === undefined) {
+                                            this._unexpected();
+                                        }
+                                        obj[name] = this._attValue().toLowerCase();
+                                        whitespace = this._whitespace(0);
+                                        continue;
+                                    }
+                                    else {
+                                        this._unexpected();
+                                    }
+                                }
+                                if (this._decoder.encoding && obj.encoding !== this._decoder.encoding) {
+                                    const position = this._position;
+                                    this._decoder = text.Decoder.open(this._data, obj.encoding);
+                                    this._seek(position);
+                                }
+                                this._expect('?>');
+                            }
                             const node = document.createProcessingInstruction(name, data);
                             this._appendChild(node);
                             break;
@@ -98,7 +128,8 @@ xml.TextReader = class {
                                 }
                             }
                             else if (this._match('ENTITY')) {
-                                this._assert(this._nodeType() === xml.NodeType.DocumentType);
+                                const documentType = this._top();
+                                this._assert(documentType.nodeType === xml.NodeType.DocumentType);
                                 this._whitespace(1);
                                 const parsed = this._char === '%';
                                 if (parsed) {
@@ -107,30 +138,36 @@ xml.TextReader = class {
                                 }
                                 const name = this._name();
                                 this._assert(name !== null);
-                                const node = document.createEntity(name);
+                                const node = documentType.createEntity(name);
                                 let whitespace = this._whitespace(0);
                                 if (whitespace && (this._char === '"' || this._char === "'")) {
                                     this._quote();
                                     whitespace = this._whitespace(0);
                                 }
-                                if (whitespace && this._match('SYSTEM')) {
-                                    this._whitespace(1);
-                                    node.systemId = this._quote();
-                                    whitespace = this._whitespace(0);
-                                }
-                                if (whitespace && this._match('PUBLIC')) {
-                                    this._whitespace(1);
-                                    node.publicId = this._pubidLiteral();
-                                    this._whitespace(1);
-                                    node.systemId = this._quote();
-                                    whitespace = this._whitespace(0);
-                                }
-                                if (whitespace && !parsed) {
-                                    if (this._match('NDATA')) {
+                                else {
+                                    if (whitespace && this._match('SYSTEM')) {
                                         this._whitespace(1);
-                                        const name = this._name();
-                                        this._assert(name !== null);
-                                        node.notationName = name;
+                                        node.systemId = this._quote();
+                                        whitespace = this._whitespace(0);
+                                    }
+                                    else if (whitespace && this._match('PUBLIC')) {
+                                        this._whitespace(1);
+                                        node.publicId = this._pubidLiteral();
+                                        this._whitespace(1);
+                                        node.systemId = this._quote();
+                                        whitespace = this._whitespace(0);
+                                    }
+                                    else {
+                                        this._unexpected();
+                                    }
+                                    if (whitespace && !parsed) {
+                                        if (this._match('NDATA')) {
+                                            this._whitespace(1);
+                                            const name = this._name();
+                                            this._assert(name !== null);
+                                            node.notationName = name;
+                                            this._whitespace(0);
+                                        }
                                     }
                                 }
                                 this._expect('>');
@@ -181,9 +218,7 @@ xml.TextReader = class {
                             const position = this._position;
                             const name = this._name();
                             this._assert(name !== null);
-                            while (this._char === '\n' || this._char === '\r') {
-                                this._next();
-                            }
+                            this._whitespace(0);
                             if (!this._match('>')) {
                                 this._unexpected();
                             }
@@ -392,7 +427,7 @@ xml.TextReader = class {
     _whitespace(count) {
         const position = this._position;
         let index = 0;
-        while (this._char === ' ' || this._char === '\n' || this._char === '\r' || this._char === '\t') {
+        while (this._char === ' ' || this._char === '\n' || this._char === '\r' || this._char === '\t' || this._char === '\x85') {
             index++;
             this._next();
         }
@@ -556,7 +591,11 @@ xml.TextReader = class {
                     }
                 }
                 if (data.length > 0 && this._match(';')) {
-                    return data.join('');
+                    const value = data.join('');
+                    if (parseInt(value, 16) > 0x10FFFF) {
+                        this._unexpected();
+                    }
+                    return value;
                 }
             }
             else if (this._match('#')) {
@@ -569,7 +608,11 @@ xml.TextReader = class {
                     }
                 }
                 if (data.length > 0 && this._match(';')) {
-                    return data.join('');
+                    const value = data.join('');
+                    if (parseInt(value, 10) > 0x10FFFF) {
+                        this._unexpected();
+                    }
+                    return value;
                 }
             }
             else {
@@ -1009,10 +1052,6 @@ xml.Document = class extends xml.Node {
         return new xml.CDataSection(this, data);
     }
 
-    createEntity(name) {
-        return new xml.Entity(this, name);
-    }
-
     createEntityReference(name) {
         return new xml.EntityReference(this, name);
     }
@@ -1060,6 +1099,10 @@ xml.DocumentType = class extends xml.Node {
         if (newChild.nodeType === xml.NodeType.Entity) {
             this._entities.setNamedItem(newChild);
         }
+    }
+
+    createEntity(name) {
+        return new xml.Entity(this.ownerDocument, name);
     }
 };
 
